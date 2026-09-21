@@ -249,10 +249,80 @@ def fetch_online(codes: tuple[str, ...]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def show_table(d: pd.DataFrame, cols: list[str], height=520):
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_chart(ticker: str, period: str) -> pd.DataFrame:
+    import yfinance as yf
+
+    hist = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = hist.columns.get_level_values(0)
+    if hist.empty:
+        return hist
+    hist = hist.reset_index()
+    hist["MA25"] = hist["Close"].rolling(25).mean()
+    hist["MA75"] = hist["Close"].rolling(75).mean()
+    return hist
+
+
+def show_chart(row: pd.Series, key: str):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    ticker = str(row.get("ticker", "")).strip()
+    if not ticker:
+        code = str(row.get("code", "")).strip()
+        ticker = f"{code}.T" if code else ""
+    if not ticker:
+        st.warning("この銘柄のチャート記号が登録されていません。")
+        return
+
+    period_label = st.segmented_control(
+        "表示期間", ["3か月", "6か月", "1年", "2年"], default="1年", key=f"period_{key}"
+    )
+    period = {"3か月": "3mo", "6か月": "6mo", "1年": "1y", "2年": "2y"}[period_label or "1年"]
+    with st.spinner("チャートを読み込んでいます…"):
+        hist = fetch_chart(ticker, period)
+    if hist.empty:
+        st.warning("株価データを取得できませんでした。しばらくしてから再度お試しください。")
+        return
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        row_heights=[0.76, 0.24], specs=[[{"secondary_y": False}], [{"secondary_y": False}]],
+    )
+    fig.add_trace(
+        go.Candlestick(
+            x=hist["Date"], open=hist["Open"], high=hist["High"],
+            low=hist["Low"], close=hist["Close"], name="株価",
+            increasing_line_color="#ef5350", decreasing_line_color="#26a69a",
+        ), row=1, col=1,
+    )
+    fig.add_trace(go.Scatter(x=hist["Date"], y=hist["MA25"], name="25日線", line=dict(color="#ffb300", width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=hist["Date"], y=hist["MA75"], name="75日線", line=dict(color="#42a5f5", width=1.5)), row=1, col=1)
+    colors = np.where(hist["Close"] >= hist["Open"], "#ef5350", "#26a69a")
+    fig.add_trace(go.Bar(x=hist["Date"], y=hist["Volume"], name="出来高", marker_color=colors), row=2, col=1)
+    fig.update_layout(
+        title=f"{row.get('code', '')} {row.get('company', '')}", height=610,
+        margin=dict(l=10, r=10, t=55, b=10), hovermode="x unified",
+        xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02, x=0),
+    )
+    fig.update_yaxes(title_text="株価（円）", row=1, col=1)
+    fig.update_yaxes(title_text="出来高", row=2, col=1)
+    st.plotly_chart(fig, width="stretch", key=f"chart_{key}")
+
+
+def show_table(d: pd.DataFrame, cols: list[str], height=520, key="table"):
     available = [c for c in cols if c in d.columns]
-    shown = d[available].rename(columns=DISPLAY)
-    st.dataframe(shown, hide_index=True, width="stretch", height=height)
+    table_data = d.reset_index(drop=True)
+    shown = table_data[available].rename(columns=DISPLAY)
+    st.caption("チャートを見るには銘柄の行をクリックしてください。")
+    event = st.dataframe(
+        shown, hide_index=True, width="stretch", height=height,
+        on_select="rerun", selection_mode="single-row", key=key,
+    )
+    selected_rows = event.selection.rows
+    if selected_rows:
+        show_chart(table_data.iloc[selected_rows[0]], key)
 
 
 @st.cache_data
@@ -304,7 +374,7 @@ tabs = st.tabs(["🏆 総合", "💹 資金流入", "📈 上方修正", "🚀 �
 with tabs[0]:
     st.subheader("複数の検索で重なる銘柄")
     st.caption(f"各部門{threshold}点以上を『上位』として数えます。総合点は得意な上位3部門を重視します。")
-    show_table(df.head(top_n), ["rank","code","company","total_score","overlap",*score_cols])
+    show_table(df.head(top_n), ["rank","code","company","total_score","overlap",*score_cols], key="overall_table")
 
 section_map = [
     (1,"money",["volume_ratio","return_5d","return_20d"]),
@@ -318,7 +388,7 @@ for tab_index, key, extras in section_map:
         st.subheader(LABELS[key] + "ランキング")
         part = df.sort_values(f"{key}_score", ascending=False).head(top_n).copy()
         part["rank"] = range(1, len(part)+1)
-        show_table(part, ["rank","code","company",f"{key}_score",*extras,"data_status"])
+        show_table(part, ["rank","code","company",f"{key}_score",*extras,"data_status"], key=f"{key}_table")
 
 with tabs[6]:
     st.subheader("銘柄ごとの5方向評価")
